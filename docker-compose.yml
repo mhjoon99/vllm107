@@ -1,0 +1,209 @@
+# 사내 GPU 서버용 vLLM 스택 (본체·리랭커는 10B 이하 / Muse-Glimmer-30B는 profile "muse"로 격리) — 배포 절차는 README.md 참고
+# 주의: 같은 서버의 기존 vLLM 스택(별도 디렉터리·포트)과 공존 — 그쪽 파일·컨테이너 절대 수정 금지
+# 기동 전 1회 (서버의 검증본 이미지 고정):
+#   docker tag vllm/vllm-openai:nightly vllm-openai:gb10-verified
+# 기동: cp .env.example .env 후 값 채우고 docker compose up -d (healthy 후 워밍업까지 자동)
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: vllm-srv
+    shm_size: "8g"
+    deploy:
+      resources:
+        limits:
+          memory: ${MEM_LIMIT:-40gb}   # 통합 메모리 서버 — 스택 보호용 상한
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface   # HF 캐시 공유 — 모델 자동 다운로드/재사용
+    ports:
+      - "53108:8000"   # LiteLLM 프록시가 http://<서버IP>:53108/v1 로 접근. 컨테이너 내부는 vLLM 기본 8000
+    command: >
+      ${MODEL_ID:?MODEL_ID를 .env에 설정하세요 (HF repo ID, 10B 이하)}
+        --served-model-name ${SERVED_NAME:-vllm-srv}
+        --dtype auto
+        --gpu-memory-utilization ${GPU_MEM_UTIL:-0.25}
+        --max-model-len ${MAX_MODEL_LEN:-8192}
+        --max-num-seqs ${MAX_NUM_SEQS:-8}
+        ${EXTRA_ARGS:-}
+    healthcheck:
+      # 이미지에 curl이 없을 수 있어 python으로 확인. 컨테이너 내부 포트(8000) 기준
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 600s   # 첫 기동은 모델 다운로드+로딩으로 오래 걸릴 수 있음
+    restart: unless-stopped
+
+  # 워밍업 — vllm이 healthy해지면 1회 실행 후 종료.
+  # 첫 요청의 커널 JIT/CUDA graph 캡처 비용(수십 초)을 미리 지불해 실사용 첫 요청이 느려지는 것 방지.
+  # GPU 불필요. 이미지에 curl이 없을 수 있어 python 사용 (healthcheck와 동일한 이유)
+  vllm-warmup:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: vllm-srv-warmup
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - python3
+      - -c
+      - |
+        import json, urllib.request
+        body = json.dumps({
+            "model": "${SERVED_NAME:-vllm-srv}",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }).encode()
+        req = urllib.request.Request(
+            "http://vllm:8000/v1/chat/completions",
+            body, {"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=180)
+        print("warmup ok")
+
+  # ── 리랭커 (별도 프로세스) ────────────────────────────────────────────────
+  # vLLM은 1 프로세스 = 1 모델이라, 리랭커는 본체(vllm)와 별개의 컨테이너로 띄운다.
+  # bge-reranker-v2-m3는 XLMRobertaForSequenceClassification → vLLM이 pooling(score) 러너로
+  # 자동 인식하므로 task 플래그 불필요. 자동 인식이 안 되면 RERANK_EXTRA_ARGS=--runner pooling
+  vllm-rerank:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: vllm-rerank-srv
+    shm_size: "2g"
+    deploy:
+      resources:
+        limits:
+          memory: ${RERANK_MEM_LIMIT:-8gb}
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "53109:8000"   # LiteLLM이 http://<서버IP>:53109 로 접근 (rerank 경로는 LiteLLM이 붙임)
+    command: >
+      ${RERANK_MODEL_ID:-BAAI/bge-reranker-v2-m3}
+        --served-model-name ${RERANK_SERVED_NAME:-bge-reranker-v2-m3}
+        --dtype auto
+        --gpu-memory-utilization ${RERANK_GPU_MEM_UTIL:-0.05}
+        --max-model-len ${RERANK_MAX_MODEL_LEN:-8192}
+        --max-num-seqs ${RERANK_MAX_NUM_SEQS:-32}
+        ${RERANK_EXTRA_ARGS:-}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+
+  # 리랭커 워밍업 겸 엔드포인트 검증 — healthy 후 1회 실행하고 종료
+  vllm-rerank-warmup:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: vllm-rerank-srv-warmup
+    depends_on:
+      vllm-rerank:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - python3
+      - -c
+      - |
+        import json, urllib.request
+        body = json.dumps({
+            "model": "${RERANK_SERVED_NAME:-bge-reranker-v2-m3}",
+            "query": "ping",
+            "documents": ["pong", "unrelated text"],
+        }).encode()
+        req = urllib.request.Request(
+            "http://vllm-rerank:8000/v1/rerank",
+            body, {"Content-Type": "application/json"})
+        print(urllib.request.urlopen(req, timeout=120).read().decode())
+        print("rerank warmup ok")
+
+  # ── Muse-Glimmer-30B (세 번째 서비스) ──────────────────────────────────────
+  # ⚠️ profiles로 격리됨 — 평시 `docker compose up -d`에는 뜨지 않는다.
+  #    기동은 반드시 `bash scripts/up_muse.sh` (메모리 예산·아키텍처 지원 선검사 포함).
+  #    이유: 이 서버는 통합 메모리를 옆 스택과 나눠 쓰고, 현재 배분(옆 0.7 + 본체 0.25
+  #    + 리랭커 0.05 = 1.00)에는 30B가 들어갈 자리가 없다. 옆 스택이 얼마를 반납할지
+  #    협의해 .env의 NEIGHBOR_GPU_MEM_UTIL / MUSE_GPU_MEM_UTIL을 맞춘 뒤에만 켤 것.
+  #
+  # 모델: image-text-to-text 멀티모달(비전 인코더 50L 포함). bf16 원본은 59.5GB라
+  #    이 서버에 못 올린다 → NVFP4 양자화본(20GB, compressed-tensors) 기본값 사용.
+  #    GB10은 Blackwell(sm_121)이라 NVFP4 네이티브 경로에 해당. 커널 문제가 나면
+  #    MUSE_MODEL_ID=RedHatAI/Muse-Glimmer-30B-INT4 (W4A16, 19.5GB)로 폴백.
+  vllm-muse:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: vllm-muse-srv
+    profiles: ["muse"]
+    shm_size: "8g"
+    deploy:
+      resources:
+        limits:
+          memory: ${MUSE_MEM_LIMIT:-32gb}
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "53110:8000"   # LiteLLM이 http://<서버IP>:53110/v1 로 접근
+    command: >
+      ${MUSE_MODEL_ID:-RedHatAI/Muse-Glimmer-30B-NVFP4}
+        --served-model-name ${MUSE_SERVED_NAME:-muse-glimmer-30b}
+        --dtype auto
+        --gpu-memory-utilization ${MUSE_GPU_MEM_UTIL:-0.22}
+        --max-model-len ${MUSE_MAX_MODEL_LEN:-8192}
+        --max-num-seqs ${MUSE_MAX_NUM_SEQS:-4}
+        --limit-mm-per-prompt '{"image":${MUSE_MAX_IMAGES:-0},"video":0}'
+        ${MUSE_EXTRA_ARGS:-}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1800s   # 20GB 최초 다운로드 + 30B 로딩 — 본체(600s)보다 넉넉히
+    restart: unless-stopped
+
+  # Muse 워밍업 — healthy 후 1회 실행하고 종료 (본체 워밍업과 동일한 이유)
+  vllm-muse-warmup:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: vllm-muse-srv-warmup
+    profiles: ["muse"]
+    depends_on:
+      vllm-muse:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - python3
+      - -c
+      - |
+        import json, urllib.request
+        body = json.dumps({
+            "model": "${MUSE_SERVED_NAME:-muse-glimmer-30b}",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+        }).encode()
+        req = urllib.request.Request(
+            "http://vllm-muse:8000/v1/chat/completions",
+            body, {"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=300)
+        print("muse warmup ok")
+
+  # 벤치마크 클라이언트 — GPU 불필요, 같은 이미지의 `vllm bench serve` CLI 사용
+  # profiles 때문에 평시 `docker compose up`에는 안 뜸. 실행은 scripts/bench_*.sh 로
+  bench:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    profiles: ["bench"]
+    entrypoint: ["vllm", "bench", "serve"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface        # 토크나이저 캐시 공유
+      - ${DATASET_DIR:-~/.cache/aigw-vllm/datasets}:/data:ro # ShareGPT 데이터셋
+      - ./results:/results                                   # 결과 jsonl 누적
