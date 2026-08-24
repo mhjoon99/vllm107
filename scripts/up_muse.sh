@@ -4,7 +4,8 @@
 # 평시 `docker compose up -d`에는 이 서비스가 뜨지 않는다. 반드시 이 스크립트로 띄운다.
 # 기동 전에 두 가지를 강제로 검사한다 — 둘 다 실패하면 서버가 죽거나 옆 스택까지 OOM:
 #   (1) 이미지가 muse_glimmer 아키텍처를 아는가 (vLLM 2026-08-14 이후 nightly만 지원)
-#   (2) 통합 메모리 예산 합이 0.90 이하인가 (옆 스택 포함)
+#   (2) 설정값 기준 메모리 예산 합이 MEM_BUDGET_CEILING 이하인가
+#   (3) /proc/meminfo 실측 여유가 실제로 충분한가 (통합 메모리라 OS까지 같이 죽는다)
 #
 # 사용법: bash scripts/up_muse.sh
 set -euo pipefail
@@ -29,10 +30,11 @@ envget() {  # envget KEY [기본값]
 VLLM_IMAGE="$(envget VLLM_IMAGE vllm-openai:gb10-verified)"
 MUSE_MODEL_ID="$(envget MUSE_MODEL_ID RedHatAI/Muse-Glimmer-30B-NVFP4)"
 MUSE_SERVED_NAME="$(envget MUSE_SERVED_NAME muse-glimmer-30b)"
-PORT=53110
+MUSE_CONTAINER_NAME="$(envget MUSE_CONTAINER_NAME vllm-muse-glimmer-30b)"
+PORT=53107
 
 # ── 검사 1: 이미지의 아키텍처 지원 ──────────────────────────────────────────
-echo "=== [1/2] 이미지 아키텍처 지원 검사: ${VLLM_IMAGE} ==="
+echo "=== [1/3] 이미지 아키텍처 지원 검사: ${VLLM_IMAGE} ==="
 if ! docker image inspect "${VLLM_IMAGE}" >/dev/null 2>&1; then
     echo "❌ 이미지 ${VLLM_IMAGE} 가 없습니다." >&2
     exit 1
@@ -79,12 +81,12 @@ esac
 
 # ── 검사 2: 통합 메모리 예산 ────────────────────────────────────────────────
 echo ""
-echo "=== [2/2] 통합 메모리 예산 검사 ==="
-NEIGHBOR="$(envget NEIGHBOR_GPU_MEM_UTIL 0.7)"
+echo "=== [2/3] 설정값 메모리 예산 검사 ==="
+NEIGHBOR="$(envget NEIGHBOR_GPU_MEM_UTIL 0)"
 MAIN="$(envget GPU_MEM_UTIL 0.25)"
 RERANK="$(envget RERANK_GPU_MEM_UTIL 0.05)"
 MUSE="$(envget MUSE_GPU_MEM_UTIL 0.22)"
-BUDGET="$(envget MEM_BUDGET_CEILING 0.90)"
+BUDGET="$(envget MEM_BUDGET_CEILING 0.80)"
 
 printf '  옆 스택 (NEIGHBOR_GPU_MEM_UTIL)  %s\n' "${NEIGHBOR}"
 printf '  본체    (GPU_MEM_UTIL)          %s\n' "${MAIN}"
@@ -110,41 +112,79 @@ MSG
 fi
 echo "✅ 예산 통과"
 
+# ── 검사 3: 실측 여유 메모리 ────────────────────────────────────────────────
+# 설정값 합계(검사 2)는 "이론상 안전한가"만 본다. GB10은 통합 메모리라
+# 실제로 지금 비어 있는지가 별개 문제다 — 여기서 /proc/meminfo로 직접 잰다.
+echo ""
+echo "=== [3/3] 실측 여유 메모리 검사 ==="
+MEM_TOTAL_KB="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+MEM_AVAIL_KB="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+# vLLM은 --gpu-memory-utilization을 "전체 메모리 대비"로 계산하므로 필요량도 전체 기준
+NEED_KB="$(awk -v t="${MEM_TOTAL_KB}" -v u="${MUSE}" 'BEGIN{printf "%d", t * u}')"
+# OS·페이지캐시·로딩 중 일시적 스파이크용 안전 여유 (기본 8GiB)
+MARGIN_KB="$(awk -v g="${MEM_SAFETY_MARGIN_GB:-8}" 'BEGIN{printf "%d", g * 1024 * 1024}')"
+
+awk -v t="${MEM_TOTAL_KB}" -v a="${MEM_AVAIL_KB}" -v n="${NEED_KB}" -v m="${MARGIN_KB}" 'BEGIN {
+    printf "  전체        %6.1f Gi\n", t/1048576
+    printf "  현재 가용   %6.1f Gi\n", a/1048576
+    printf "  Muse 필요   %6.1f Gi  (MUSE_GPU_MEM_UTIL 기준)\n", n/1048576
+    printf "  안전 여유   %6.1f Gi\n", m/1048576
+    printf "  ─────────────────────────────────\n"
+    printf "  기동 후 예상 잔여  %6.1f Gi\n", (a-n)/1048576
+}'
+
+if ! awk -v a="${MEM_AVAIL_KB}" -v n="${NEED_KB}" -v m="${MARGIN_KB}" 'BEGIN { exit !(a >= n + m) }'; then
+    cat >&2 <<MSG
+
+❌ 실측 여유 부족 — 기동을 중단합니다.
+   GB10은 CPU와 GPU가 같은 메모리를 씁니다. 부족한 채로 띄우면 vLLM이 죽는 게
+   아니라 **OS의 OOM killer가 아무 프로세스나 잡아 서버 전체가 불안정해집니다.**
+
+   조치:
+     · 지금 뭐가 쓰고 있는지 확인:  docker ps  /  free -h  /  nvidia-smi
+     · 안 쓰는 컨테이너 정리 후 재시도
+     · .env의 MUSE_GPU_MEM_UTIL 하향 (0.18 미만은 KV가 안 남아 의미 없음)
+     · 안전 여유를 줄이려면 MEM_SAFETY_MARGIN_GB (기본 8) — 권장하지 않음
+MSG
+    exit 1
+fi
+echo "✅ 실측 통과"
+
 # ── 기동 ────────────────────────────────────────────────────────────────────
 echo ""
 echo "[info] 모델: ${MUSE_MODEL_ID}"
 echo "[info] 최초 기동은 양자화본 ~20GB 다운로드 + 30B 로딩으로 오래 걸립니다."
-echo "[info] 로그 실시간 보기: docker logs -f vllm-muse-srv"
+echo "[info] 로그 실시간 보기: docker logs -f ${MUSE_CONTAINER_NAME}"
 docker compose --profile muse up -d vllm-muse vllm-muse-warmup
 
 MAX_WAIT_SEC="${MAX_WAIT_SEC:-3600}"
 ELAPSED=0
 until curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; do
-    if ! docker ps --format '{{.Names}}' | grep -q '^vllm-muse-srv$'; then
+    if ! docker ps --format '{{.Names}}' | grep -q "^${MUSE_CONTAINER_NAME}$"; then
         echo ""
         echo "❌ 컨테이너가 종료됐습니다. 마지막 로그:"
-        docker logs --tail 40 vllm-muse-srv
+        docker logs --tail 40 ${MUSE_CONTAINER_NAME}
         exit 1
     fi
     if (( ELAPSED >= MAX_WAIT_SEC )); then
-        echo "❌ ${MAX_WAIT_SEC}초 안에 서버가 뜨지 않았습니다. docker logs vllm-muse-srv 로 확인하세요."
+        echo "❌ ${MAX_WAIT_SEC}초 안에 서버가 뜨지 않았습니다. docker logs ${MUSE_CONTAINER_NAME} 로 확인하세요."
         exit 1
     fi
     sleep 5
     ELAPSED=$((ELAPSED + 5))
     if (( ELAPSED % 30 == 0 )); then
-        echo "  [${ELAPSED}s] $(docker logs --tail 1 vllm-muse-srv 2>&1 | tail -c 120)"
+        echo "  [${ELAPSED}s] $(docker logs --tail 1 ${MUSE_CONTAINER_NAME} 2>&1 | tail -c 120)"
     fi
 done
 
 echo ""
 echo "✅ Muse-Glimmer 준비 완료: http://localhost:${PORT}"
-echo "[info] 워밍업 확인: docker logs vllm-muse-srv-warmup   (\"muse warmup ok\"면 정상)"
+echo "[info] 워밍업 확인: docker logs ${MUSE_CONTAINER_NAME}-warmup   (\"muse warmup ok\"면 정상)"
 echo ""
 echo "=== 메모리 실측 (MUSE_GPU_MEM_UTIL 재조정 근거로 기록) ==="
-docker logs vllm-muse-srv 2>&1 \
+docker logs ${MUSE_CONTAINER_NAME} 2>&1 \
     | grep -E "Model loading took|Available KV cache memory|GPU KV cache size|Maximum concurrency" \
-    || echo "(해당 로그 라인을 찾지 못했습니다 — docker logs vllm-muse-srv 로 직접 확인)"
+    || echo "(해당 로그 라인을 찾지 못했습니다 — docker logs ${MUSE_CONTAINER_NAME} 로 직접 확인)"
 echo ""
 echo "=== 현재 통합 메모리 ==="
 free -h

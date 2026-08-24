@@ -10,42 +10,54 @@ if [[ ! -f .env ]]; then
     exit 1
 fi
 
+# .env를 통째로 source하지 않는다 (EXTRA_ARGS 같은 다중 토큰 값이 명령으로 실행됨)
+envget() {  # envget KEY [기본값]
+    local v
+    v="$(grep -E "^${1}=" .env \
+        | tr -d '\015' \
+        | tail -n1 | cut -d= -f2- \
+        | sed -e 's/[[:space:]]*#.*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' -e 's/[[:space:]]*$//')"
+    printf '%s' "${v:-$2}"
+}
+CONTAINER_NAME="$(envget CONTAINER_NAME vllm-main)"
+RERANK_CONTAINER_NAME="$(envget RERANK_CONTAINER_NAME vllm-bge-reranker-v2-m3)"
+
 docker compose up -d   # vllm + vllm-warmup (bench는 profiles로 제외됨)
 
 PORT=53108
 echo ""
 echo "[info] 서버 기동 대기 중... (최초 실행은 모델 다운로드 때문에 수 분~수십 분 걸릴 수 있음)"
-echo "[info] 로그 실시간 보기: docker logs -f vllm-srv"
+echo "[info] 로그 실시간 보기: docker logs -f ${CONTAINER_NAME}"
 
 MAX_WAIT_SEC="${MAX_WAIT_SEC:-1800}"
 ELAPSED=0
 until curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; do
-    if ! docker ps --format '{{.Names}}' | grep -q '^vllm-srv$'; then
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         echo ""
         echo "❌ 컨테이너가 종료됐습니다. 마지막 로그:"
-        docker logs --tail 30 vllm-srv
+        docker logs --tail 30 ${CONTAINER_NAME}
         exit 1
     fi
     if (( ELAPSED >= MAX_WAIT_SEC )); then
-        echo "❌ ${MAX_WAIT_SEC}초 안에 서버가 뜨지 않았습니다. docker logs vllm-srv 로 확인하세요."
+        echo "❌ ${MAX_WAIT_SEC}초 안에 서버가 뜨지 않았습니다. docker logs ${CONTAINER_NAME} 로 확인하세요."
         exit 1
     fi
     sleep 5
     ELAPSED=$((ELAPSED + 5))
     if (( ELAPSED % 30 == 0 )); then
-        echo "  [${ELAPSED}s] $(docker logs --tail 1 vllm-srv 2>&1 | tail -c 120)"
+        echo "  [${ELAPSED}s] $(docker logs --tail 1 ${CONTAINER_NAME} 2>&1 | tail -c 120)"
     fi
 done
 
 echo ""
 echo "✅ vLLM 서버 준비 완료: http://localhost:${PORT}"
 echo ""
-echo "[info] 워밍업은 vllm-warmup 컨테이너가 자동 수행 — 확인: docker logs vllm-srv-warmup"
+echo "[info] 워밍업은 vllm-warmup 컨테이너가 자동 수행 — 확인: docker logs ${CONTAINER_NAME}-warmup"
 echo ""
 echo "=== 메모리 지표 (R8 예산 검증용 — 이 값들을 계획서에 기록) ==="
-docker logs vllm-srv 2>&1 \
+docker logs ${CONTAINER_NAME} 2>&1 \
     | grep -E "Model loading took|Available KV cache memory|GPU KV cache size|Maximum concurrency" \
-    || echo "(해당 로그 라인을 찾지 못했습니다 — docker logs vllm-srv 로 직접 확인)"
+    || echo "(해당 로그 라인을 찾지 못했습니다 — docker logs ${CONTAINER_NAME} 로 직접 확인)"
 echo ""
 echo "=== 현재 통합 메모리 (GB10은 nvidia-smi 대신 free) ==="
 free -h

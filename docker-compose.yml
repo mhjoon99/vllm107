@@ -1,12 +1,21 @@
-# 사내 GPU 서버용 vLLM 스택 (본체·리랭커는 10B 이하 / Muse-Glimmer-30B는 profile "muse"로 격리) — 배포 절차는 README.md 참고
-# 주의: 같은 서버의 기존 vLLM 스택(별도 디렉터리·포트)과 공존 — 그쪽 파일·컨테이너 절대 수정 금지
+# 사내 GPU 서버용 vLLM 스택 — 서버에는 이 파일 + .env + README.md 세 개만 있으면 된다.
+#   본체(vllm, :53108) / 리랭커(vllm-rerank, :53109) / Muse-Glimmer-30B(vllm-muse, :53107)
+#   vLLM은 1 프로세스 = 1 모델이라 모델마다 서비스가 따로 있다. 자세한 건 README.md.
+#
 # 기동 전 1회 (서버의 검증본 이미지 고정):
 #   docker tag vllm/vllm-openai:nightly vllm-openai:gb10-verified
-# 기동: cp .env.example .env 후 값 채우고 docker compose up -d (healthy 후 워밍업까지 자동)
+#   cp .env.example .env  &&  vi .env      # MODEL_ID 필수
+#
+# 기동:
+#   docker compose up -d                      # 본체 + 리랭커 (+ 각 워밍업 자동)
+#   docker compose --profile muse up -d       # 위 + Muse (선검사 muse-preflight 통과해야 뜸)
+#
+# ⚠️ 셸 스크립트는 필요 없다. 메모리 예산·아키텍처 선검사는 muse-preflight 서비스가
+#    compose 안에서 수행하고, 실패하면 vllm-muse가 시작되지 않는다.
 services:
   vllm:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
-    container_name: vllm-srv
+    container_name: ${CONTAINER_NAME:-vllm-main}
     shm_size: "8g"
     deploy:
       resources:
@@ -43,7 +52,7 @@ services:
   # GPU 불필요. 이미지에 curl이 없을 수 있어 python 사용 (healthcheck와 동일한 이유)
   vllm-warmup:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
-    container_name: vllm-srv-warmup
+    container_name: ${CONTAINER_NAME:-vllm-main}-warmup
     depends_on:
       vllm:
         condition: service_healthy
@@ -71,7 +80,7 @@ services:
   # 자동 인식하므로 task 플래그 불필요. 자동 인식이 안 되면 RERANK_EXTRA_ARGS=--runner pooling
   vllm-rerank:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
-    container_name: vllm-rerank-srv
+    container_name: ${RERANK_CONTAINER_NAME:-vllm-bge-reranker-v2-m3}
     shm_size: "2g"
     deploy:
       resources:
@@ -105,7 +114,7 @@ services:
   # 리랭커 워밍업 겸 엔드포인트 검증 — healthy 후 1회 실행하고 종료
   vllm-rerank-warmup:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
-    container_name: vllm-rerank-srv-warmup
+    container_name: ${RERANK_CONTAINER_NAME:-vllm-bge-reranker-v2-m3}-warmup
     depends_on:
       vllm-rerank:
         condition: service_healthy
@@ -126,12 +135,126 @@ services:
         print(urllib.request.urlopen(req, timeout=120).read().decode())
         print("rerank warmup ok")
 
+  # ── Muse-Glimmer-30B 기동 전 선검사 ────────────────────────────────────────
+  # vllm-muse가 이 서비스에 depends_on(service_completed_successfully)로 묶여 있다.
+  # → `docker compose --profile muse up -d` 한 번이면 검사 → 기동 순서로 자동 진행되고,
+  #   검사가 실패하면(exit 1) vllm-muse는 Created 상태로 남아 **절대 시작되지 않는다.**
+  # 별도 셸 스크립트가 필요 없다. 검사 내용을 보려면:
+  #   docker compose --profile muse logs muse-preflight
+  muse-preflight:
+    image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
+    container_name: ${MUSE_CONTAINER_NAME:-vllm-muse-glimmer-30b}-preflight
+    profiles: ["muse"]
+    restart: "no"
+    # ⚠️ deploy.resources.limits.memory를 주지 말 것.
+    #    도커는 /proc/meminfo를 가상화하지 않으므로 컨테이너 안에서도 호스트 실측이 보인다.
+    environment:
+      NEIGHBOR:  ${NEIGHBOR_GPU_MEM_UTIL:-0}
+      MAIN:      ${GPU_MEM_UTIL:-0.25}
+      RERANK:    ${RERANK_GPU_MEM_UTIL:-0.03}
+      MUSE:      ${MUSE_GPU_MEM_UTIL:-0.22}
+      CEILING:   ${MEM_BUDGET_CEILING:-0.80}
+      MARGIN_GB: ${MEM_SAFETY_MARGIN_GB:-8}
+    # awk가 아니라 python3를 쓴다 — vLLM 이미지에 반드시 있는 유일한 인터프리터다.
+    entrypoint: ["python3", "-c"]
+    command:
+      - |
+        import importlib.util, os, sys
+
+        print("=" * 64)
+        print(" Muse-Glimmer-30B 기동 전 선검사")
+        print("=" * 64)
+        fail = []
+
+        # ── [1/3] 이미지가 muse_glimmer 아키텍처를 아는가 ────────────────────
+        # 이 컨테이너는 vllm-muse와 같은 이미지다 → 여기서 통과하면 실제로 뜬다.
+        try:
+            import vllm
+            version = vllm.__version__
+            ok = importlib.util.find_spec("vllm.model_executor.models.muse_glimmer") is not None
+        except Exception as exc:          # VLLM_IMAGE가 vLLM 이미지가 아닌 경우
+            version, ok = "import 실패 ({})".format(exc), False
+        print("[1/3] 아키텍처 지원   vLLM {}  ->  {}".format(version, "OK" if ok else "NOSUPPORT"))
+        if not ok:
+            fail.append("""
+        [1/3] 실패 — 이 이미지에는 muse_glimmer 아키텍처가 없습니다.
+          vLLM의 Muse-Glimmer 지원은 2026-08-14 main에 들어갔고, 정식 릴리스
+          v0.27.1(2026-08-11)에는 없습니다. 그대로 띄우면
+          "Unrecognized architecture MuseGlimmerForConditionalGeneration"로 즉시 종료됩니다.
+
+          해결 — 기존 검증본 태그는 보존하고 새 태그로 받아 검증하세요:
+            docker pull vllm/vllm-openai:nightly
+            docker tag vllm/vllm-openai:nightly vllm-openai:gb10-verified-2
+            vi .env      # VLLM_IMAGE=vllm-openai:gb10-verified-2
+          주의: VLLM_IMAGE는 본체·리랭커도 함께 씁니다 -> 세 서비스 전부 GB10 재검증 대상.
+        """)
+
+        # ── [2/3] 설정값 메모리 예산 합계 ────────────────────────────────────
+        # vLLM의 --gpu-memory-utilization은 각 프로세스가 "전체 메모리 기준"으로
+        # 독립 계산한다. 인스턴스끼리 조율하지 않으므로 합은 사람이 관리해야 한다.
+        def num(key, default):
+            try:
+                return float(os.environ.get(key) or default)
+            except ValueError:
+                return float(default)
+
+        neighbor = num("NEIGHBOR", 0)
+        main     = num("MAIN", 0.25)
+        rerank   = num("RERANK", 0.03)
+        muse     = num("MUSE", 0.22)
+        ceiling  = num("CEILING", 0.80)
+        total    = neighbor + main + rerank + muse
+        print("[2/3] 설정 예산       옆 {:.2f} + 본체 {:.2f} + 리랭커 {:.2f} + Muse {:.2f}"
+              " = {:.2f}   (상한 {:.2f})".format(neighbor, main, rerank, muse, total, ceiling))
+        if total > ceiling:
+            fail.append("""
+        [2/3] 실패 — 설정값 메모리 예산 초과.
+          조치 (하나 선택):
+            · 옆 스택이 반납한 값을 .env의 NEIGHBOR_GPU_MEM_UTIL에 반영
+            · GPU_MEM_UTIL / RERANK_GPU_MEM_UTIL / MUSE_GPU_MEM_UTIL 하향
+          상한 자체를 올리려면 MEM_BUDGET_CEILING (권장하지 않음).
+        """)
+
+        # ── [3/3] 실측 여유 메모리 ───────────────────────────────────────────
+        # [2/3]은 "이론상 안전한가", 여기는 "지금 실제로 뜰 자리가 있나"를 본다.
+        # GB10은 통합 메모리라 부족하면 vLLM이 죽는 게 아니라 OS의 OOM killer가 돈다.
+        meminfo = {}
+        for line in open("/proc/meminfo"):
+            key, _, value = line.partition(":")
+            meminfo[key] = float(value.split()[0])      # kB
+        GI = 1048576.0
+        mem_total = meminfo["MemTotal"]
+        mem_avail = meminfo["MemAvailable"]
+        need   = mem_total * muse       # util은 "전체 기준" 비율이므로 필요량도 전체 기준
+        margin = num("MARGIN_GB", 8) * GI
+        print("[3/3] 실측 메모리     전체 {:.1f}Gi / 가용 {:.1f}Gi / Muse 필요 {:.1f}Gi"
+              " + 안전여유 {:.1f}Gi  ->  기동 후 잔여 {:.1f}Gi".format(
+              mem_total / GI, mem_avail / GI, need / GI, margin / GI,
+              (mem_avail - need) / GI))
+        if mem_avail < need + margin:
+            fail.append("""
+        [3/3] 실패 — 실측 여유 부족.
+          GB10은 CPU와 GPU가 같은 메모리를 씁니다. 부족한 채로 띄우면 vLLM이 죽는 게
+          아니라 OS의 OOM killer가 아무 프로세스나 잡아 서버 전체가 불안정해집니다.
+
+          조치:
+            · docker ps / free -h 로 지금 뭐가 쓰고 있는지 확인 후 정리
+            · .env의 MUSE_GPU_MEM_UTIL 하향 (0.18 미만은 KV가 안 남아 의미 없음)
+            · MEM_SAFETY_MARGIN_GB(기본 8) 하향 — 권장하지 않음
+        """)
+
+        print("=" * 64)
+        if fail:
+            sys.stderr.write("".join(fail))
+            sys.stderr.write("\n선검사 실패 - vllm-muse를 기동하지 않습니다.\n")
+            sys.exit(1)
+        print(" 선검사 통과 - vllm-muse를 기동합니다.")
+        print("=" * 64)
+
   # ── Muse-Glimmer-30B (세 번째 서비스) ──────────────────────────────────────
-  # ⚠️ profiles로 격리됨 — 평시 `docker compose up -d`에는 뜨지 않는다.
-  #    기동은 반드시 `bash scripts/up_muse.sh` (메모리 예산·아키텍처 지원 선검사 포함).
-  #    이유: 이 서버는 통합 메모리를 옆 스택과 나눠 쓰고, 현재 배분(옆 0.7 + 본체 0.25
-  #    + 리랭커 0.05 = 1.00)에는 30B가 들어갈 자리가 없다. 옆 스택이 얼마를 반납할지
-  #    협의해 .env의 NEIGHBOR_GPU_MEM_UTIL / MUSE_GPU_MEM_UTIL을 맞춘 뒤에만 켤 것.
+  # ⚠️ profiles로 격리 — 평시 `docker compose up -d`(본체+리랭커)에는 뜨지 않는다.
+  #    기동:  docker compose --profile muse up -d
+  #    위 muse-preflight가 먼저 돌고, 통과해야만 이 서비스가 시작된다.
   #
   # 모델: image-text-to-text 멀티모달(비전 인코더 50L 포함). bf16 원본은 59.5GB라
   #    이 서버에 못 올린다 → NVFP4 양자화본(20GB, compressed-tensors) 기본값 사용.
@@ -139,8 +262,11 @@ services:
   #    MUSE_MODEL_ID=RedHatAI/Muse-Glimmer-30B-INT4 (W4A16, 19.5GB)로 폴백.
   vllm-muse:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
-    container_name: vllm-muse-srv
+    container_name: ${MUSE_CONTAINER_NAME:-vllm-muse-glimmer-30b}
     profiles: ["muse"]
+    depends_on:
+      muse-preflight:
+        condition: service_completed_successfully
     shm_size: "8g"
     deploy:
       resources:
@@ -154,7 +280,7 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ports:
-      - "53110:8000"   # LiteLLM이 http://<서버IP>:53110/v1 로 접근
+      - "53107:8000"   # LiteLLM이 http://<서버IP>:53107/v1 로 접근 (구 :53107 스택 철거 후 회수한 포트)
     command: >
       ${MUSE_MODEL_ID:-RedHatAI/Muse-Glimmer-30B-NVFP4}
         --served-model-name ${MUSE_SERVED_NAME:-muse-glimmer-30b}
@@ -170,12 +296,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 1800s   # 20GB 최초 다운로드 + 30B 로딩 — 본체(600s)보다 넉넉히
-    restart: unless-stopped
+    # ⚠️ 본체·리랭커와 달리 "no"다. unless-stopped면 재부팅 후 도커 데몬이 선검사를
+    #    건너뛰고 되살린다 — 그 사이 .env 배분이 바뀌었으면 부팅 직후 OOM이 난다.
+    #    재부팅 후에는 `docker compose --profile muse up -d`로 다시 검사를 거쳐 올릴 것.
+    restart: ${MUSE_RESTART:-no}
 
   # Muse 워밍업 — healthy 후 1회 실행하고 종료 (본체 워밍업과 동일한 이유)
   vllm-muse-warmup:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
-    container_name: vllm-muse-srv-warmup
+    container_name: ${MUSE_CONTAINER_NAME:-vllm-muse-glimmer-30b}-warmup
     profiles: ["muse"]
     depends_on:
       vllm-muse:
@@ -198,7 +327,12 @@ services:
         print("muse warmup ok")
 
   # 벤치마크 클라이언트 — GPU 불필요, 같은 이미지의 `vllm bench serve` CLI 사용
-  # profiles 때문에 평시 `docker compose up`에는 안 뜸. 실행은 scripts/bench_*.sh 로
+  # profiles 때문에 평시 `docker compose up`에는 안 뜸. 인자를 직접 줘서 실행한다:
+  #   docker compose --profile bench run --rm bench \
+  #     --backend openai-chat --host <서버IP> --port 53108 \
+  #     --endpoint /v1/chat/completions --model <MODEL_ID> \
+  #     --served-model-name <SERVED_NAME> --dataset-name random --num-prompts 50
+  # ShareGPT 데이터셋을 쓰려면 DATASET_DIR에 미리 받아둘 것 (README.md의 부하 테스트 절)
   bench:
     image: ${VLLM_IMAGE:-vllm-openai:gb10-verified}
     profiles: ["bench"]

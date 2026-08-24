@@ -1,0 +1,4 @@
+# 이 저장소의 파일은 Linux 서버(GB10)로 scp되어 그대로 실행된다.
+# Git for Windows는 기본 core.autocrlf=true라 체크아웃할 때 CRLF로 되돌리는데,
+# 그러면 compose 안의 파이썬 선검사가 깨질 수 있다. 작업 트리를 항상 LF로 고정한다.
+* text=auto eol=lf
